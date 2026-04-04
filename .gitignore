@@ -1,0 +1,17 @@
+# Bazel files
+bazel-*
+
+Cargo.lock
+target
+
+*stats*
+bin
+*.sh
+*.dat
+*.data
+*.svg
+*.txt
+.DS_Store
+.idea
+CMakeFiles
+
