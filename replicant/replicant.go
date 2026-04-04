@@ -1,15 +1,16 @@
 package replicant
 
 import (
+	"net"
+	"strconv"
+	"strings"
+
 	"github.com/psu-csl/replicated-store/go/config"
 	"github.com/psu-csl/replicated-store/go/kvstore"
 	consensusLog "github.com/psu-csl/replicated-store/go/log"
 	"github.com/psu-csl/replicated-store/go/multipaxos"
 	pb "github.com/psu-csl/replicated-store/go/multipaxos/comm"
 	logger "github.com/sirupsen/logrus"
-	"net"
-	"strconv"
-	"strings"
 )
 
 type Replicant struct {
@@ -90,18 +91,45 @@ func (r *Replicant) executorThread() {
 		if instance == nil {
 			break
 		}
-		if instance.Command.Type == pb.CommandType_ADDNODE || instance.
-			Command.Type == pb.CommandType_DELNODE {
-			r.multipaxos.Reconfigure(instance.Command)
+		if len(instance.Commands) == 0 {
+			continue
+		}
+
+		if instance.Commands[0].Type == pb.CommandType_ADDNODE || instance.
+			Commands[0].Type == pb.CommandType_DELNODE {
+			r.multipaxos.Reconfigure(instance.Commands[0])
 			client := r.clientManager.Get(instance.ClientId)
 			if client != nil {
 				client.Write("joined")
 			}
 		} else {
-			id, result := r.log.Execute(instance)
-			client := r.clientManager.Get(id)
+			results := r.log.Execute(instance)
+			if len(results) == 0 {
+				continue
+			}
+
+			var batchResult string
+			priorClientId := results[0].ClientId
+			for _, res := range results {
+				clientId := res.ClientId
+				if clientId == priorClientId {
+					if batchResult == "" {
+						batchResult = res.Result
+					} else {
+						batchResult += " " + res.Result
+					}
+				} else {
+					client := r.clientManager.Get(priorClientId)
+					if client != nil {
+						client.Write(batchResult)
+					}
+					batchResult = res.Result
+					priorClientId = clientId
+				}
+			}
+			client := r.clientManager.Get(priorClientId)
 			if client != nil {
-				client.Write(result.Value)
+				client.Write(batchResult)
 			}
 		}
 	}

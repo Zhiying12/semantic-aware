@@ -3,17 +3,23 @@ package log
 import (
 	"bytes"
 	"encoding/gob"
+	"sync"
+
 	"github.com/golang/protobuf/proto"
 	"github.com/psu-csl/replicated-store/go/kvstore"
 	pb "github.com/psu-csl/replicated-store/go/multipaxos/comm"
 	logger "github.com/sirupsen/logrus"
-	"sync"
 )
 
 type Snapshot struct {
 	LastIncludedIndex int64
 	SnapshotData      []byte
 	Ballot            int64
+}
+
+type ExecutionResult struct {
+	ClientId int64
+	Result   string
 }
 
 func IsCommitted(instance *pb.Instance) bool {
@@ -34,9 +40,19 @@ func IsEqualCommand(cmd1, cmd2 *pb.Command) bool {
 }
 
 func IsEqualInstance(a, b *pb.Instance) bool {
-	return a.GetBallot() == b.GetBallot() && a.GetIndex() == b.GetIndex() &&
-		a.GetClientId() == b.GetClientId() && a.GetState() == b.GetState() &&
-		IsEqualCommand(a.GetCommand(), b.GetCommand())
+	if a.GetBallot() != b.GetBallot() || a.GetIndex() != b.GetIndex() ||
+		a.GetClientId() != b.GetClientId() || a.GetState() != b.GetState() {
+		return false
+	}
+	if len(a.GetCommands()) != len(b.GetCommands()) {
+		return false
+	}
+	for i := range a.GetCommands() {
+		if !IsEqualCommand(a.GetCommands()[i], b.GetCommands()[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func Insert(log map[int64]*pb.Instance, instance *pb.Instance) bool {
@@ -205,9 +221,16 @@ func (l *Log) ReadInstance() *pb.Instance {
 	return instance
 }
 
-func (l *Log) Execute(instance *pb.Instance) (int64, *kvstore.KVResult) {
-	result := kvstore.Execute(instance.GetCommand(), l.kvStore)
-	return instance.ClientId, &result
+func (l *Log) Execute(instance *pb.Instance) []ExecutionResult {
+	var results []ExecutionResult
+	for _, cmd := range instance.Commands {
+		res := kvstore.Execute(cmd, l.kvStore)
+		results = append(results, ExecutionResult{
+			ClientId: cmd.ClientId,
+			Result:   res.Value,
+		})
+	}
+	return results
 }
 
 func (l *Log) CommitUntil(leaderLastExecuted int64, ballot int64) {

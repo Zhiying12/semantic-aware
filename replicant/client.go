@@ -80,8 +80,8 @@ func (c *Client) Parse(request string) []*pb.Command {
 
 	commands := make([]*pb.Command, 0, numCommands)
 	for i := 0; i < numCommands; i++ {
-		cmdCopy := *command
-		commands = append(commands, &cmdCopy)
+		command.ClientId = c.id
+		commands = append(commands, command)
 	}
 	return commands
 }
@@ -104,19 +104,16 @@ func (c *Client) Read() {
 
 		commands := c.Parse(request)
 		if len(commands) > 0 {
-			for _, command := range commands {
-				result := c.multipaxos.Replicate(command, c.id)
-				if result.Type == multipaxos.Ok {
-					continue
-				}
-				if result.Type == multipaxos.Retry {
-					c.Write("retry")
-				} else {
-					if result.Type != multipaxos.SomeElseLeader {
-						panic("Result is not someone_else_leader")
-					}
-					c.Write("leader is " + strconv.FormatInt(result.Leader, 10))
-				}
+			resultChan := c.multipaxos.Replicate(commands, c.id)
+			result := <-resultChan
+			if result.Type == multipaxos.Ok {
+				continue
+			} else if result.Type == multipaxos.Retry {
+				c.Write("retry")
+			} else if result.Type == multipaxos.SomeElseLeader {
+				c.Write("leader is " + strconv.FormatInt(result.Leader, 10))
+			} else {
+				panic("Result is not someone_else_leader")
 			}
 		} else {
 			c.Write("bad command")

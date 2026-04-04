@@ -14,6 +14,8 @@ type Config struct {
 	DbPath         string   `json:"db_path"`
 	ElectionLimit  int64    `json:"election_limit"`
 	Threshold      int64    `json:"threshold"`
+	BatchSize      int      `json:"batch_size"`
+	BatchTimeout   int64    `json:"batch_timeout"`
 }
 
 func DefaultConfig(id int64, n int) Config {
