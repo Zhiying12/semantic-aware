@@ -31,8 +31,7 @@ func NewClient(id int64, conn net.Conn, mp *multipaxos.Multipaxos,
 	return client
 }
 
-func (c *Client) Parse(request string) *pb.Command {
-	substrings := strings.SplitN(strings.TrimRight(request, "\n"), " ", 3)
+func (c *Client) ParseCommand(substrings []string) *pb.Command {
 	if len(substrings) < 2 {
 		return nil
 	}
@@ -63,6 +62,30 @@ func (c *Client) Parse(request string) *pb.Command {
 	return command
 }
 
+func (c *Client) Parse(request string) []*pb.Command {
+	substrings := strings.SplitN(strings.TrimRight(request, "\n"), " ", 4)
+	if len(substrings) < 3 {
+		return nil
+	}
+
+	numCommands, err := strconv.Atoi(substrings[0])
+	if err != nil || numCommands <= 0 {
+		return nil
+	}
+
+	command := c.ParseCommand(substrings[1:])
+	if command == nil {
+		return nil
+	}
+
+	commands := make([]*pb.Command, 0, numCommands)
+	for i := 0; i < numCommands; i++ {
+		cmdCopy := *command
+		commands = append(commands, &cmdCopy)
+	}
+	return commands
+}
+
 func (c *Client) Start() {
 	go c.Read()
 }
@@ -79,19 +102,21 @@ func (c *Client) Read() {
 			return
 		}
 
-		command := c.Parse(request)
-		if command != nil {
-			result := c.multipaxos.Replicate(command, c.id)
-			if result.Type == multipaxos.Ok {
-				continue
-			}
-			if result.Type == multipaxos.Retry {
-				c.Write("retry")
-			} else {
-				if result.Type != multipaxos.SomeElseLeader {
-					panic("Result is not someone_else_leader")
+		commands := c.Parse(request)
+		if len(commands) > 0 {
+			for _, command := range commands {
+				result := c.multipaxos.Replicate(command, c.id)
+				if result.Type == multipaxos.Ok {
+					continue
 				}
-				c.Write("leader is " + strconv.FormatInt(result.Leader, 10))
+				if result.Type == multipaxos.Retry {
+					c.Write("retry")
+				} else {
+					if result.Type != multipaxos.SomeElseLeader {
+						panic("Result is not someone_else_leader")
+					}
+					c.Write("leader is " + strconv.FormatInt(result.Leader, 10))
+				}
 			}
 		} else {
 			c.Write("bad command")
