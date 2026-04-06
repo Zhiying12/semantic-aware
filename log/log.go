@@ -5,10 +5,10 @@ import (
 	"encoding/gob"
 	"sync"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/psu-csl/replicated-store/go/kvstore"
 	pb "github.com/psu-csl/replicated-store/go/multipaxos/comm"
 	logger "github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/proto"
 )
 
 type Snapshot struct {
