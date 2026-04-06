@@ -1,8 +1,9 @@
 package multipaxos
 
 import (
-	pb "github.com/psu-csl/replicated-store/go/multipaxos/comm"
 	"sync"
+
+	pb "github.com/psu-csl/replicated-store/go/multipaxos/comm"
 )
 
 const (
@@ -41,6 +42,7 @@ const (
 type Result struct {
 	Type   ResultType
 	Leader int64
+	Value  string
 }
 
 func ExtractLeaderId(ballot int64) int64 {

@@ -3,6 +3,7 @@ package kvstore
 import (
 	"bytes"
 	"encoding/gob"
+
 	logger "github.com/sirupsen/logrus"
 )
 
@@ -37,6 +38,15 @@ func (s *MemKVStore) Del(key string) bool {
 	} else {
 		return false
 	}
+}
+
+func (s *MemKVStore) Append(key string, suffix string) bool {
+	if value, ok := s.store[key]; ok {
+		s.store[key] = value + suffix
+	} else {
+		s.store[key] = suffix
+	}
+	return true
 }
 
 func (s *MemKVStore) Close() {}

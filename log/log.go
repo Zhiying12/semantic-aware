@@ -35,13 +35,16 @@ func IsInProgress(instance *pb.Instance) bool {
 }
 
 func IsEqualCommand(cmd1, cmd2 *pb.Command) bool {
-	return cmd1.GetType() == cmd2.GetType() && cmd1.GetKey() == cmd2.GetKey() &&
+	return cmd1.GetType() == cmd2.GetType() &&
+		cmd1.GetKey() == cmd2.GetKey() &&
 		cmd1.GetValue() == cmd2.GetValue()
 }
 
 func IsEqualInstance(a, b *pb.Instance) bool {
-	if a.GetBallot() != b.GetBallot() || a.GetIndex() != b.GetIndex() ||
-		a.GetClientId() != b.GetClientId() || a.GetState() != b.GetState() {
+	if a.GetBallot() != b.GetBallot() ||
+		a.GetIndex() != b.GetIndex() ||
+		a.GetClientId() != b.GetClientId() ||
+		a.GetState() != b.GetState() {
 		return false
 	}
 	if len(a.GetCommands()) != len(b.GetCommands()) {
@@ -87,6 +90,7 @@ type Log struct {
 	mu                 sync.Mutex
 	cvExecutable       *sync.Cond
 	cvCommittable      *sync.Cond
+	cvExecuted         *sync.Cond
 }
 
 func NewLog(s kvstore.KVStore) *Log {
@@ -101,20 +105,19 @@ func NewLog(s kvstore.KVStore) *Log {
 	}
 	l.cvExecutable = sync.NewCond(&l.mu)
 	l.cvCommittable = sync.NewCond(&l.mu)
+	l.cvExecuted = sync.NewCond(&l.mu)
 	return &l
 }
 
 func (l *Log) LastExecuted() int64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
 	return l.lastExecuted
 }
 
 func (l *Log) GlobalLastExecuted() int64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
 	return l.globalLastExecuted
 }
 
@@ -146,7 +149,8 @@ func (l *Log) Stop() {
 	defer l.mu.Unlock()
 	l.running = false
 	l.kvStore.Close()
-	l.cvExecutable.Signal()
+	l.cvExecutable.Broadcast()
+	l.cvExecuted.Broadcast()
 }
 
 func (l *Log) IsExecutable() bool {
@@ -218,12 +222,34 @@ func (l *Log) ReadInstance() *pb.Instance {
 	}
 	instance.State = pb.InstanceState_EXECUTED
 	l.lastExecuted += 1
+	l.cvExecuted.Broadcast()
 	return instance
+}
+
+func (l *Log) WaitUntilExecuted(index int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	for l.running && l.lastExecuted < index {
+		l.cvExecuted.Wait()
+	}
+}
+
+// TODO: probably not needed
+func (l *Log) GetValue(key string) (bool, string) {
+	value := l.kvStore.Get(key)
+	if value != nil {
+		return true, *value
+	}
+	return false, kvstore.NotFound
 }
 
 func (l *Log) Execute(instance *pb.Instance) []ExecutionResult {
 	var results []ExecutionResult
 	for _, cmd := range instance.Commands {
+		if cmd.Type == pb.CommandType_NOOP {
+			continue
+		}
 		res := kvstore.Execute(cmd, l.kvStore)
 		results = append(results, ExecutionResult{
 			ClientId: cmd.ClientId,
@@ -333,17 +359,20 @@ func (l *Log) MakeSnapshot(ballot int64) (*bytes.Buffer, error) {
 		logger.Error(err)
 		return nil, err
 	}
+
 	snapshot := Snapshot{
 		LastIncludedIndex: l.lastExecuted,
 		SnapshotData:      storeData,
 		Ballot:            ballot,
 	}
+
 	buffer := &bytes.Buffer{}
 	err = gob.NewEncoder(buffer).Encode(&snapshot)
 	if err != nil {
 		logger.Error(err)
 		return nil, err
 	}
+
 	logger.Infof("snapshot last index: %v\n", snapshot.LastIncludedIndex)
 	return buffer, nil
 }
@@ -363,6 +392,10 @@ func (l *Log) ResumeSnapshot(snapshot *Snapshot) {
 	l.mu.Unlock()
 
 	l.kvStore.RestoreSnapshot(snapshot.SnapshotData)
+
+	l.mu.Lock()
+	l.cvExecuted.Broadcast()
+	l.mu.Unlock()
 }
 
 func (l *Log) GetLogStatus() (int, int64, int64, int64, []int64) {

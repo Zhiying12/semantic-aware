@@ -20,6 +20,7 @@ type KVStore interface {
 	Get(key string) *string
 	Put(key string, value string) bool
 	Del(key string) bool
+	Append(key string, suffix string) bool
 	Close()
 	MakeSnapshot() ([]byte, error)
 	RestoreSnapshot([]byte)
@@ -37,28 +38,33 @@ func CreateStore(config config.Config) KVStore {
 }
 
 func Execute(cmd *pb.Command, store KVStore) KVResult {
-	if cmd.Type == pb.CommandType_GET {
+	switch cmd.Type {
+	case pb.CommandType_GET:
 		value := store.Get(cmd.Key)
 		if value != nil {
 			return KVResult{Ok: true, Value: *value}
-		} else {
-			return KVResult{Ok: false, Value: NotFound}
 		}
-	}
+		return KVResult{Ok: false, Value: NotFound}
 
-	if cmd.Type == pb.CommandType_PUT {
+	case pb.CommandType_PUT:
 		if store.Put(cmd.Key, cmd.Value) {
 			return KVResult{Ok: true, Value: Empty}
 		}
 		return KVResult{Ok: false, Value: NotFound}
-	}
 
-	if cmd.Type != pb.CommandType_DEL {
-		panic("Command type not Del")
-	}
+	case pb.CommandType_APPEND:
+		if store.Append(cmd.Key, cmd.Value) {
+			return KVResult{Ok: true, Value: Empty}
+		}
+		return KVResult{Ok: false, Value: NotFound}
 
-	if store.Del(cmd.Key) {
-		return KVResult{Ok: true, Value: Empty}
+	case pb.CommandType_DEL:
+		if store.Del(cmd.Key) {
+			return KVResult{Ok: true, Value: Empty}
+		}
+		return KVResult{Ok: false, Value: NotFound}
+
+	default:
+		panic("unsupported command type" + cmd.Type.String())
 	}
-	return KVResult{Ok: false, Value: NotFound}
 }

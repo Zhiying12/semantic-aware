@@ -70,8 +70,10 @@ enum CommandType {
   GET = 0;
   PUT = 1;
   DEL = 2;
-  ADDNODE = 3;
-  DELNODE = 4;
+  APPEND = 3;
+  ADDNODE = 4;
+  DELNODE = 5;
+  NOOP = 6;
 }
 
 enum InstanceState {

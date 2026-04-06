@@ -52,13 +52,9 @@ type Multipaxos struct {
 	requestChan    chan *PendingRequest
 	batcherRunning int32
 	batcherDone    chan struct{}
+	nextReqID      int64
 
 	pb.UnimplementedMultiPaxosRPCServer
-}
-
-type PendingRequest struct {
-	Commands []*pb.Command
-	Callback chan Result
 }
 
 func NewMultipaxos(log *Log.Log, config config.Config, join bool) *Multipaxos {
@@ -192,6 +188,7 @@ func (p *Multipaxos) Stop() {
 	p.StopRPCServer()
 	p.StopPrepareThread()
 	p.StopCommitThread()
+
 	if p.batchSize > 1 {
 		atomic.StoreInt32(&p.batcherRunning, 0)
 		close(p.requestChan)
@@ -272,53 +269,121 @@ func (p *Multipaxos) StopCommitThread() {
 	p.cvLeader.Signal()
 }
 
+func (p *Multipaxos) collectBatch(first *PendingRequest,
+	stash **PendingRequest) []*PendingRequest {
+
+	batch := []*PendingRequest{first}
+	if p.batchSize <= 1 {
+		return batch
+	}
+
+	timer := time.NewTimer(p.batchTimeout)
+	defer timer.Stop()
+
+	for len(batch) < p.batchSize {
+		select {
+		case req, ok := <-p.requestChan:
+			if !ok {
+				return batch
+			}
+			if req.Kind != first.Kind {
+				*stash = req
+				return batch
+			}
+			batch = append(batch, req)
+		case <-timer.C:
+			return batch
+		}
+	}
+	return batch
+}
+
+func (p *Multipaxos) handleReadBatch(batch []*PendingRequest) {
+	ballot := p.Ballot()
+	if !IsLeader(ballot, p.id) {
+		res := Result{Type: SomeElseLeader, Leader: ExtractLeaderId(ballot)}
+		for _, req := range batch {
+			req.Callback <- res
+		}
+		return
+	}
+
+	barrierIndex := p.log.AdvanceLastIndex()
+	barrierCmd := &pb.Command{
+		Type:     pb.CommandType_NOOP,
+		ClientId: -1,
+	}
+
+	res := p.RunAcceptPhase(ballot, barrierIndex, []*pb.Command{barrierCmd}, -1)
+	if res.Type != Ok {
+		for _, req := range batch {
+			req.Callback <- res
+		}
+		return
+	}
+
+	p.log.WaitUntilExecuted(barrierIndex)
+
+	for _, req := range batch {
+		_, value := p.log.GetValue(req.Commands[0].Key)
+		req.Callback <- Result{
+			Type:   Ok,
+			Leader: -1,
+			Value:  value,
+		}
+	}
+}
+
+func (p *Multipaxos) handleWriteBatch(batch []*PendingRequest) {
+	ballot := p.Ballot()
+	if !IsLeader(ballot, p.id) {
+		res := Result{Type: SomeElseLeader, Leader: ExtractLeaderId(ballot)}
+		for _, req := range batch {
+			req.Callback <- res
+		}
+		return
+	}
+
+	eb := buildEffectBatch(batch)
+	commands := materializeEffectBatch(eb)
+
+	clientID := int64(-1)
+	if len(batch) == 1 {
+		clientID = batch[0].ClientID
+	}
+
+	res := p.RunAcceptPhase(ballot, p.log.AdvanceLastIndex(), commands, clientID)
+	for _, req := range batch {
+		req.Callback <- res
+	}
+}
+
 func (p *Multipaxos) Batcher() {
 	defer close(p.batcherDone)
+
+	var stash *PendingRequest
 	for atomic.LoadInt32(&p.batcherRunning) == 1 {
-		var batch []*PendingRequest
-
-		req, ok := <-p.requestChan
-		if !ok {
-			return
-		}
-		batch = append(batch, req)
-
-		timeout := time.After(p.batchTimeout)
-		collecting := true
-		for collecting && len(batch) < p.batchSize {
-			select {
-			case r, ok := <-p.requestChan:
-				if !ok {
-					collecting = false
-				} else {
-					batch = append(batch, r)
-				}
-			case <-timeout:
-				collecting = false
+		var first *PendingRequest
+		if stash != nil {
+			first = stash
+			stash = nil
+		} else {
+			req, ok := <-p.requestChan
+			if !ok {
+				return
 			}
+			first = req
 		}
 
+		batch := p.collectBatch(first, &stash)
 		if len(batch) == 0 {
 			continue
 		}
 
-		var combinedCommands []*pb.Command
-		for _, r := range batch {
-			combinedCommands = append(combinedCommands, r.Commands...)
-		}
-
-		var result Result
-		ballot := p.Ballot()
-		if !IsLeader(ballot, p.id) {
-			result = Result{Type: SomeElseLeader, Leader: ExtractLeaderId(ballot)}
+		if first.Kind == ReadRequest {
+			p.handleReadBatch(batch)
 		} else {
-			result = p.RunAcceptPhase(ballot, p.log.AdvanceLastIndex(), combinedCommands, -1)
-		}
-
-		for _, r := range batch {
-			if r.Callback != nil {
-				r.Callback <- result
-			}
+			p.handleWriteBatch(batch)
 		}
 	}
 }
@@ -326,25 +391,34 @@ func (p *Multipaxos) Batcher() {
 func (p *Multipaxos) Replicate(commands []*pb.Command, clientId int64) chan Result {
 	resultChan := make(chan Result, 1)
 	ballot := p.Ballot()
-	if IsLeader(ballot, p.id) {
-		if p.batchSize == 1 {
-			result := p.RunAcceptPhase(ballot, p.log.AdvanceLastIndex(), commands, clientId)
-			resultChan <- result
-			return resultChan
-		}
 
-		req := &PendingRequest{
-			Commands: commands,
-			Callback: resultChan,
+	if !IsLeader(ballot, p.id) {
+		if IsSomeoneElseLeader(ballot, p.id) {
+			resultChan <- Result{Type: SomeElseLeader, Leader: ExtractLeaderId(ballot)}
+		} else {
+			resultChan <- Result{Type: Retry, Leader: -1}
 		}
-		p.requestChan <- req
 		return resultChan
 	}
-	if IsSomeoneElseLeader(ballot, p.id) {
-		resultChan <- Result{Type: SomeElseLeader, Leader: ExtractLeaderId(ballot)}
+
+	req := &PendingRequest{
+		ReqID:    p.nextRequestID(),
+		Kind:     classifyRequest(commands),
+		ClientID: clientId,
+		Commands: commands,
+		Callback: resultChan,
+	}
+
+	if p.batchSize == 1 {
+		if req.Kind == ReadRequest {
+			p.handleReadBatch([]*PendingRequest{req})
+		} else {
+			p.handleWriteBatch([]*PendingRequest{req})
+		}
 		return resultChan
 	}
-	resultChan <- Result{Type: Retry, Leader: -1}
+
+	p.requestChan <- req
 	return resultChan
 }
 
@@ -478,7 +552,10 @@ func (p *Multipaxos) RunAcceptPhase(ballot int64, index int64,
 		state.NumOks++
 		p.log.Append(&instance)
 	} else {
-		return Result{SomeElseLeader, ExtractLeaderId(p.Ballot())}
+		return Result{
+			Type:   SomeElseLeader,
+			Leader: ExtractLeaderId(p.Ballot()),
+		}
 	}
 
 	request := pb.AcceptRequest{
@@ -646,14 +723,14 @@ func (p *Multipaxos) Replay(ballot int64, lastIndex int64) {
 			clientId = instance.GetClientId()
 		} else {
 			cmds = []*pb.Command{{
-				Type: pb.CommandType_GET,
-				Key:  "1",
+				Type:     pb.CommandType_NOOP,
+				ClientId: -1,
 			}}
 			clientId = -1
 		}
+
 		go func(index int64, cmds []*pb.Command, clientId int64) {
 			r := p.RunAcceptPhase(ballot, index, cmds, clientId)
-
 			for r.Type == Retry {
 				r = p.RunAcceptPhase(ballot, index, cmds, clientId)
 			}
@@ -680,11 +757,8 @@ func (p *Multipaxos) RequestInstanceGap() {
 		logger.Error(err)
 		return
 	}
-	//logger.Infof("before - last_index: %v\n", request.LastIndex)
-	//count := 0
 	for {
 		instance, err := stream.Recv()
-		//count += 1
 		if err == io.EOF {
 			break
 		} else if err != nil {
@@ -693,7 +767,6 @@ func (p *Multipaxos) RequestInstanceGap() {
 		}
 		p.log.Append(instance)
 	}
-	//logger.Infof("Recovered missing instances, recv: %v\n", count)
 }
 
 func (p *Multipaxos) Reconfigure(cmd *pb.Command) {
@@ -714,9 +787,11 @@ func (p *Multipaxos) Reconfigure(cmd *pb.Command) {
 			p.rpcPeers.List = append(p.rpcPeers.List,
 				NewRpcPeer(int64(peerId), client))
 			p.rpcPeers.Unlock()
+
 			if !IsLeader(p.Ballot(), p.id) {
 				return
 			}
+
 			stream, err := client.ResumeSnapshot(context.Background())
 			if err != nil {
 				return
@@ -725,6 +800,7 @@ func (p *Multipaxos) Reconfigure(cmd *pb.Command) {
 			if err != nil {
 				return
 			}
+
 			for offset := 0; offset < buffer.Len(); offset += ChunkSize {
 				var chunk []byte
 				if offset+ChunkSize > buffer.Len() {
@@ -835,10 +911,12 @@ func (p *Multipaxos) ResumeSnapshot(stream pb.MultiPaxosRPC_ResumeSnapshotServer
 			}
 			p.BecomeFollower(snapshot.Ballot)
 			p.log.ResumeSnapshot(snapshot)
+
 			p.mu.Lock()
 			p.joinReady = true
 			p.cvLeader.Signal()
 			p.mu.Unlock()
+
 			go p.RequestInstanceGap()
 			return stream.SendAndClose(&pb.SnapshotResponse{Done: true})
 		}
