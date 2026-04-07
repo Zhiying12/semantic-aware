@@ -2,11 +2,12 @@ package replicant
 
 import (
 	"bufio"
-	"github.com/psu-csl/replicated-store/go/multipaxos"
-	pb "github.com/psu-csl/replicated-store/go/multipaxos/comm"
 	"net"
 	"strconv"
 	"strings"
+
+	"github.com/psu-csl/replicated-store/go/multipaxos"
+	pb "github.com/psu-csl/replicated-store/go/multipaxos/comm"
 )
 
 type Client struct {
@@ -107,7 +108,10 @@ func (c *Client) Read() {
 			resultChan := c.multipaxos.Replicate(commands, c.id)
 			result := <-resultChan
 			if result.Type == multipaxos.Ok {
-				continue
+				if result.Value == "" {
+					continue
+				}
+				c.Write(result.Value)
 			} else if result.Type == multipaxos.Retry {
 				c.Write("retry")
 			} else if result.Type == multipaxos.SomeElseLeader {
