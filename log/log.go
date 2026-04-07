@@ -236,28 +236,54 @@ func (l *Log) WaitUntilExecuted(index int64) {
 }
 
 // TODO: probably not needed
-func (l *Log) GetValue(key string) (bool, string) {
-	value := l.kvStore.Get(key)
-	if value != nil {
-		return true, *value
-	}
-	return false, kvstore.NotFound
+func (l *Log) GetValue(keys []string) []*string {
+	values := l.kvStore.BatchRead(keys)
+	return values
 }
 
 func (l *Log) Execute(instance *pb.Instance) []ExecutionResult {
-	var results []ExecutionResult
+	results := make([]ExecutionResult, 0)
+	writeKeys := make([]string, 0)
+	writeValues := make([]string, 0)
+	putCmds := make([]*pb.Command, 0)
+
+	flushPuts := func() {
+		if len(writeKeys) > 0 {
+			l.kvStore.BatchWrite(writeKeys, writeValues)
+			for _, cmd := range putCmds {
+				for _, clientId := range cmd.ClientId {
+					results = append(results, ExecutionResult{
+						ClientId: clientId,
+						Result:   kvstore.Empty,
+					})
+				}
+			}
+			writeKeys = writeKeys[:0]
+			writeValues = writeValues[:0]
+			putCmds = putCmds[:0]
+		}
+	}
+
 	for _, cmd := range instance.Commands {
 		if cmd.Type == pb.CommandType_NOOP {
 			continue
 		}
-		res := kvstore.Execute(cmd, l.kvStore)
-		for _, clientId := range cmd.ClientId {
-			results = append(results, ExecutionResult{
-				ClientId: clientId,
-				Result:   res.Value,
-			})
+		if cmd.Type == pb.CommandType_PUT {
+			writeKeys = append(writeKeys, cmd.Key)
+			writeValues = append(writeValues, cmd.Value)
+			putCmds = append(putCmds, cmd)
+		} else {
+			flushPuts()
+			res := kvstore.Execute(cmd, l.kvStore)
+			for _, clientId := range cmd.ClientId {
+				results = append(results, ExecutionResult{
+					ClientId: clientId,
+					Result:   res.Value,
+				})
+			}
 		}
 	}
+	flushPuts()
 	return results
 }
 
