@@ -236,9 +236,12 @@ func (l *Log) WaitUntilExecuted(index int64) {
 }
 
 // TODO: probably not needed
-func (l *Log) GetValue(keys []string) []*string {
-	values := l.kvStore.BatchRead(keys)
-	return values
+func (l *Log) GetValue(key string) string {
+	val := l.kvStore.Get(key)
+	if val != nil {
+		return *val
+	}
+	return ""
 }
 
 func (l *Log) Execute(instance *pb.Instance) []ExecutionResult {

@@ -331,26 +331,14 @@ func (p *Multipaxos) handleMixedBatch(batch []*PendingRequest, eb *EffectBatch) 
 		p.log.WaitUntilExecuted(index)
 	}
 
-	keys := make([]string, 0)
 	for _, req := range batch {
 		if req.Kind == ReadRequest {
-			keys = append(keys, req.Commands[0].Key)
-		}
-	}
-	values := p.log.GetValue(keys)
-	valueIndex := 0
-	for _, req := range batch {
-		if req.Kind == ReadRequest {
-			val := ""
-			if values[valueIndex] != nil {
-				val = *values[valueIndex]
-			}
+			val := p.log.GetValue(req.Commands[0].Key)
 			req.Callback <- Result{
 				Type:   Ok,
 				Leader: -1,
 				Value:  val,
 			}
-			valueIndex++
 		} else {
 			req.Callback <- res
 		}
