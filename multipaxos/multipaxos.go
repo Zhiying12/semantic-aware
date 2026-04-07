@@ -269,17 +269,12 @@ func (p *Multipaxos) StopCommitThread() {
 	p.cvLeader.Signal()
 }
 
-func (p *Multipaxos) collectBatch(first *PendingRequest,
-	stash **PendingRequest) ([]*PendingRequest, *EffectBatch) {
-
+func (p *Multipaxos) collectBatch(first *PendingRequest) ([]*PendingRequest, *EffectBatch) {
 	batch := make([]*PendingRequest, 0, p.batchSize)
 	batch = append(batch, first)
 
-	var eb *EffectBatch
-	if first.Kind == WriteRequest {
-		eb = NewEffectBatch(p.batchSize)
-		eb.Add(first)
-	}
+	eb := NewEffectBatch(p.batchSize)
+	eb.Add(first)
 
 	if p.batchSize <= 1 {
 		return batch, eb
@@ -294,14 +289,8 @@ func (p *Multipaxos) collectBatch(first *PendingRequest,
 			if !ok {
 				return batch, eb
 			}
-			if req.Kind != first.Kind {
-				*stash = req
-				return batch, eb
-			}
 			batch = append(batch, req)
-			if eb != nil {
-				eb.Add(req)
-			}
+			eb.Add(req)
 		case <-timer.C:
 			return batch, eb
 		}
@@ -309,43 +298,7 @@ func (p *Multipaxos) collectBatch(first *PendingRequest,
 	return batch, eb
 }
 
-func (p *Multipaxos) handleReadBatch(batch []*PendingRequest) {
-	ballot := p.Ballot()
-	if !IsLeader(ballot, p.id) {
-		res := Result{Type: SomeElseLeader, Leader: ExtractLeaderId(ballot)}
-		for _, req := range batch {
-			req.Callback <- res
-		}
-		return
-	}
-
-	barrierIndex := p.log.AdvanceLastIndex()
-	barrierCmd := &pb.Command{
-		Type:     pb.CommandType_NOOP,
-		ClientId: []int64{-1},
-	}
-
-	res := p.RunAcceptPhase(ballot, barrierIndex, []*pb.Command{barrierCmd}, -1)
-	if res.Type != Ok {
-		for _, req := range batch {
-			req.Callback <- res
-		}
-		return
-	}
-
-	p.log.WaitUntilExecuted(barrierIndex)
-
-	for _, req := range batch {
-		_, value := p.log.GetValue(req.Commands[0].Key)
-		req.Callback <- Result{
-			Type:   Ok,
-			Leader: -1,
-			Value:  value,
-		}
-	}
-}
-
-func (p *Multipaxos) handleWriteBatch(batch []*PendingRequest, eb *EffectBatch) {
+func (p *Multipaxos) handleMixedBatch(batch []*PendingRequest, eb *EffectBatch) {
 	ballot := p.Ballot()
 	if !IsLeader(ballot, p.id) {
 		res := Result{Type: SomeElseLeader, Leader: ExtractLeaderId(ballot)}
@@ -362,39 +315,49 @@ func (p *Multipaxos) handleWriteBatch(batch []*PendingRequest, eb *EffectBatch) 
 		clientID = batch[0].ClientID
 	}
 
-	res := p.RunAcceptPhase(ballot, p.log.AdvanceLastIndex(), commands, clientID)
+	index := p.log.AdvanceLastIndex()
+	res := p.RunAcceptPhase(ballot, index, commands, clientID)
+
+	if res.Type != Ok {
+		for _, req := range batch {
+			req.Callback <- res
+		}
+		return
+	}
+
+	if eb.HasReads {
+		p.log.WaitUntilExecuted(index)
+	}
+
 	for _, req := range batch {
-		req.Callback <- res
+		if req.Kind == ReadRequest {
+			_, value := p.log.GetValue(req.Commands[0].Key)
+			req.Callback <- Result{
+				Type:   Ok,
+				Leader: -1,
+				Value:  value,
+			}
+		} else {
+			req.Callback <- res
+		}
 	}
 }
 
 func (p *Multipaxos) Batcher() {
 	defer close(p.batcherDone)
 
-	var stash *PendingRequest
 	for atomic.LoadInt32(&p.batcherRunning) == 1 {
-		var first *PendingRequest
-		if stash != nil {
-			first = stash
-			stash = nil
-		} else {
-			req, ok := <-p.requestChan
-			if !ok {
-				return
-			}
-			first = req
+		req, ok := <-p.requestChan
+		if !ok {
+			return
 		}
 
-		batch, eb := p.collectBatch(first, &stash)
+		batch, eb := p.collectBatch(req)
 		if len(batch) == 0 {
 			continue
 		}
 
-		if first.Kind == ReadRequest {
-			p.handleReadBatch(batch)
-		} else {
-			p.handleWriteBatch(batch, eb)
-		}
+		p.handleMixedBatch(batch, eb)
 	}
 }
 
@@ -420,13 +383,9 @@ func (p *Multipaxos) Replicate(commands []*pb.Command, clientId int64) chan Resu
 	}
 
 	if p.batchSize == 1 {
-		if req.Kind == ReadRequest {
-			p.handleReadBatch([]*PendingRequest{req})
-		} else {
-			eb := NewEffectBatch(1)
-			eb.Add(req)
-			p.handleWriteBatch([]*PendingRequest{req}, eb)
-		}
+		eb := NewEffectBatch(1)
+		eb.Add(req)
+		p.handleMixedBatch([]*PendingRequest{req}, eb)
 		return resultChan
 	}
 

@@ -56,13 +56,19 @@ type EffectBatch struct {
 	Nodes     []*EffectNode
 	TailByKey map[string]*EffectNode
 	Seq       int64
+	HasReads  bool
 }
 
 func classifyRequest(commands []*pb.Command) RequestKind {
-	if len(commands) == 1 && commands[0].Type == pb.CommandType_GET {
-		return ReadRequest
+	if len(commands) == 0 {
+		return WriteRequest
 	}
-	return WriteRequest
+	for _, cmd := range commands {
+		if cmd.Type != pb.CommandType_GET {
+			return WriteRequest
+		}
+	}
+	return ReadRequest
 }
 
 func (p *Multipaxos) nextRequestID() int64 {
@@ -145,13 +151,23 @@ func NewEffectBatch(capacity int) *EffectBatch {
 		Nodes:     make([]*EffectNode, 0, capacity),
 		TailByKey: make(map[string]*EffectNode, capacity),
 		Seq:       0,
+		HasReads:  false,
 	}
 }
 
 func (eb *EffectBatch) Add(req *PendingRequest) {
+	if req.Kind == ReadRequest {
+		eb.HasReads = true
+		return
+	}
+
 	// Only single-command requests participate in condensation.
 	if len(req.Commands) != 1 {
 		for i, cmd := range req.Commands {
+			if cmd.Type == pb.CommandType_GET {
+				eb.HasReads = true
+				continue
+			}
 			node := newExplicitNode(cmd, req, i, eb.Seq)
 			eb.Seq++
 			eb.Nodes = append(eb.Nodes, node)
@@ -161,6 +177,11 @@ func (eb *EffectBatch) Add(req *PendingRequest) {
 	}
 
 	cmd := req.Commands[0]
+	if cmd.Type == pb.CommandType_GET {
+		eb.HasReads = true
+		return
+	}
+
 	tail := eb.TailByKey[cmd.Key]
 	if canAbsorb(tail, cmd) {
 		absorb(tail, req, 0, cmd)
@@ -174,7 +195,14 @@ func (eb *EffectBatch) Add(req *PendingRequest) {
 }
 
 func materializeEffectBatch(eb *EffectBatch) []*pb.Command {
-	commands := make([]*pb.Command, 0, len(eb.Nodes))
+	commands := make([]*pb.Command, 0, len(eb.Nodes)+1)
+
+	if eb.HasReads {
+		commands = append(commands, &pb.Command{
+			Type:     pb.CommandType_NOOP,
+			ClientId: []int64{-1},
+		})
+	}
 
 	for _, node := range eb.Nodes {
 		switch node.Kind {
