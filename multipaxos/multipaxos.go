@@ -270,11 +270,19 @@ func (p *Multipaxos) StopCommitThread() {
 }
 
 func (p *Multipaxos) collectBatch(first *PendingRequest,
-	stash **PendingRequest) []*PendingRequest {
+	stash **PendingRequest) ([]*PendingRequest, *EffectBatch) {
 
-	batch := []*PendingRequest{first}
+	batch := make([]*PendingRequest, 0, p.batchSize)
+	batch = append(batch, first)
+
+	var eb *EffectBatch
+	if first.Kind == WriteRequest {
+		eb = NewEffectBatch(p.batchSize)
+		eb.Add(first)
+	}
+
 	if p.batchSize <= 1 {
-		return batch
+		return batch, eb
 	}
 
 	timer := time.NewTimer(p.batchTimeout)
@@ -284,18 +292,21 @@ func (p *Multipaxos) collectBatch(first *PendingRequest,
 		select {
 		case req, ok := <-p.requestChan:
 			if !ok {
-				return batch
+				return batch, eb
 			}
 			if req.Kind != first.Kind {
 				*stash = req
-				return batch
+				return batch, eb
 			}
 			batch = append(batch, req)
+			if eb != nil {
+				eb.Add(req)
+			}
 		case <-timer.C:
-			return batch
+			return batch, eb
 		}
 	}
-	return batch
+	return batch, eb
 }
 
 func (p *Multipaxos) handleReadBatch(batch []*PendingRequest) {
@@ -334,7 +345,7 @@ func (p *Multipaxos) handleReadBatch(batch []*PendingRequest) {
 	}
 }
 
-func (p *Multipaxos) handleWriteBatch(batch []*PendingRequest) {
+func (p *Multipaxos) handleWriteBatch(batch []*PendingRequest, eb *EffectBatch) {
 	ballot := p.Ballot()
 	if !IsLeader(ballot, p.id) {
 		res := Result{Type: SomeElseLeader, Leader: ExtractLeaderId(ballot)}
@@ -344,7 +355,6 @@ func (p *Multipaxos) handleWriteBatch(batch []*PendingRequest) {
 		return
 	}
 
-	eb := buildEffectBatch(batch)
 	commands := materializeEffectBatch(eb)
 
 	clientID := int64(-1)
@@ -375,7 +385,7 @@ func (p *Multipaxos) Batcher() {
 			first = req
 		}
 
-		batch := p.collectBatch(first, &stash)
+		batch, eb := p.collectBatch(first, &stash)
 		if len(batch) == 0 {
 			continue
 		}
@@ -383,7 +393,7 @@ func (p *Multipaxos) Batcher() {
 		if first.Kind == ReadRequest {
 			p.handleReadBatch(batch)
 		} else {
-			p.handleWriteBatch(batch)
+			p.handleWriteBatch(batch, eb)
 		}
 	}
 }
@@ -413,7 +423,9 @@ func (p *Multipaxos) Replicate(commands []*pb.Command, clientId int64) chan Resu
 		if req.Kind == ReadRequest {
 			p.handleReadBatch([]*PendingRequest{req})
 		} else {
-			p.handleWriteBatch([]*PendingRequest{req})
+			eb := NewEffectBatch(1)
+			eb.Add(req)
+			p.handleWriteBatch([]*PendingRequest{req}, eb)
 		}
 		return resultChan
 	}

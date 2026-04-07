@@ -1,6 +1,7 @@
 package multipaxos
 
 import (
+	"strings"
 	"sync/atomic"
 
 	pb "github.com/psu-csl/replicated-store/go/multipaxos/comm"
@@ -46,7 +47,7 @@ type EffectNode struct {
 	Command      *pb.Command
 	BaseKind     SummaryBaseKind
 	PutValue     string
-	AppendSuffix string
+	AppendSuffix strings.Builder
 	Members      []PendingCommandRef
 	Seq          int64
 }
@@ -54,6 +55,7 @@ type EffectNode struct {
 type EffectBatch struct {
 	Nodes     []*EffectNode
 	TailByKey map[string]*EffectNode
+	Seq       int64
 }
 
 func classifyRequest(commands []*pb.Command) RequestKind {
@@ -95,9 +97,9 @@ func absorb(node *EffectNode, req *PendingRequest, cmdIndex int, cmd *pb.Command
 	case pb.CommandType_PUT:
 		node.BaseKind = SummaryFromPut
 		node.PutValue = cmd.Value
-		node.AppendSuffix = ""
+		node.AppendSuffix.Reset()
 	case pb.CommandType_APPEND:
-		node.AppendSuffix += cmd.Value
+		node.AppendSuffix.WriteString(cmd.Value)
 	}
 	node.Members = append(node.Members, PendingCommandRef{
 		Req:      req,
@@ -109,11 +111,10 @@ func newNodeFromCommand(cmd *pb.Command, req *PendingRequest, cmdIndex int, seq 
 	switch cmd.Type {
 	case pb.CommandType_PUT:
 		return &EffectNode{
-			Kind:         WriteSummaryNode,
-			Key:          cmd.Key,
-			BaseKind:     SummaryFromPut,
-			PutValue:     cmd.Value,
-			AppendSuffix: "",
+			Kind:     WriteSummaryNode,
+			Key:      cmd.Key,
+			BaseKind: SummaryFromPut,
+			PutValue: cmd.Value,
 			Members: []PendingCommandRef{{
 				Req:      req,
 				CmdIndex: cmdIndex,
@@ -121,56 +122,55 @@ func newNodeFromCommand(cmd *pb.Command, req *PendingRequest, cmdIndex int, seq 
 			Seq: seq,
 		}
 	case pb.CommandType_APPEND:
-		return &EffectNode{
-			Kind:         WriteSummaryNode,
-			Key:          cmd.Key,
-			BaseKind:     SummaryFromStore,
-			PutValue:     "",
-			AppendSuffix: cmd.Value,
+		node := &EffectNode{
+			Kind:     WriteSummaryNode,
+			Key:      cmd.Key,
+			BaseKind: SummaryFromStore,
+			PutValue: "",
 			Members: []PendingCommandRef{{
 				Req:      req,
 				CmdIndex: cmdIndex,
 			}},
 			Seq: seq,
 		}
+		node.AppendSuffix.WriteString(cmd.Value)
+		return node
 	default:
 		return newExplicitNode(cmd, req, cmdIndex, seq)
 	}
 }
 
-func buildEffectBatch(batch []*PendingRequest) *EffectBatch {
-	eb := &EffectBatch{
-		Nodes:     make([]*EffectNode, 0),
-		TailByKey: make(map[string]*EffectNode),
+func NewEffectBatch(capacity int) *EffectBatch {
+	return &EffectBatch{
+		Nodes:     make([]*EffectNode, 0, capacity),
+		TailByKey: make(map[string]*EffectNode, capacity),
+		Seq:       0,
 	}
-	var seq int64
+}
 
-	for _, req := range batch {
-		// Only single-command requests participate in condensation.
-		if len(req.Commands) != 1 {
-			for i, cmd := range req.Commands {
-				node := newExplicitNode(cmd, req, i, seq)
-				seq++
-				eb.Nodes = append(eb.Nodes, node)
-				eb.TailByKey[cmd.Key] = node
-			}
-			continue
+func (eb *EffectBatch) Add(req *PendingRequest) {
+	// Only single-command requests participate in condensation.
+	if len(req.Commands) != 1 {
+		for i, cmd := range req.Commands {
+			node := newExplicitNode(cmd, req, i, eb.Seq)
+			eb.Seq++
+			eb.Nodes = append(eb.Nodes, node)
+			eb.TailByKey[cmd.Key] = node
 		}
-
-		cmd := req.Commands[0]
-		tail := eb.TailByKey[cmd.Key]
-		if canAbsorb(tail, cmd) {
-			absorb(tail, req, 0, cmd)
-			continue
-		}
-
-		node := newNodeFromCommand(cmd, req, 0, seq)
-		seq++
-		eb.Nodes = append(eb.Nodes, node)
-		eb.TailByKey[cmd.Key] = node
+		return
 	}
 
-	return eb
+	cmd := req.Commands[0]
+	tail := eb.TailByKey[cmd.Key]
+	if canAbsorb(tail, cmd) {
+		absorb(tail, req, 0, cmd)
+		return
+	}
+
+	node := newNodeFromCommand(cmd, req, 0, eb.Seq)
+	eb.Seq++
+	eb.Nodes = append(eb.Nodes, node)
+	eb.TailByKey[cmd.Key] = node
 }
 
 func materializeEffectBatch(eb *EffectBatch) []*pb.Command {
@@ -182,7 +182,7 @@ func materializeEffectBatch(eb *EffectBatch) []*pb.Command {
 			commands = append(commands, node.Command)
 
 		case WriteSummaryNode:
-			var clientIDs []int64
+			clientIDs := make([]int64, 0, len(node.Members))
 			for _, member := range node.Members {
 				clientIDs = append(clientIDs, member.Req.ClientID)
 			}
@@ -193,14 +193,14 @@ func materializeEffectBatch(eb *EffectBatch) []*pb.Command {
 				commands = append(commands, &pb.Command{
 					Type:     pb.CommandType_PUT,
 					Key:      node.Key,
-					Value:    node.PutValue + node.AppendSuffix,
+					Value:    node.PutValue + node.AppendSuffix.String(),
 					ClientId: clientIDs,
 				})
 			} else {
 				commands = append(commands, &pb.Command{
 					Type:     pb.CommandType_APPEND,
 					Key:      node.Key,
-					Value:    node.AppendSuffix,
+					Value:    node.AppendSuffix.String(),
 					ClientId: clientIDs,
 				})
 			}
