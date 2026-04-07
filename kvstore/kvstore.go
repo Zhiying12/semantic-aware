@@ -21,6 +21,8 @@ type KVStore interface {
 	Put(key string, value string) bool
 	Del(key string) bool
 	Append(key string, suffix string) bool
+	BatchRead(keys []string) []*string
+	BatchWrite(keys []string, values []string) bool
 	Close()
 	MakeSnapshot() ([]byte, error)
 	RestoreSnapshot([]byte)

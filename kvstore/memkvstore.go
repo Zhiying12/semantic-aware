@@ -49,6 +49,24 @@ func (s *MemKVStore) Append(key string, suffix string) bool {
 	return true
 }
 
+func (s *MemKVStore) BatchRead(keys []string) []*string {
+	results := make([]*string, len(keys))
+	for i, key := range keys {
+		results[i] = s.Get(key)
+	}
+	return results
+}
+
+func (s *MemKVStore) BatchWrite(keys []string, values []string) bool {
+	if len(keys) != len(values) {
+		return false
+	}
+	for i, key := range keys {
+		s.Put(key, values[i])
+	}
+	return true
+}
+
 func (s *MemKVStore) Close() {}
 
 func (s *MemKVStore) MakeSnapshot() ([]byte, error) {
