@@ -283,7 +283,8 @@ func (p *Multipaxos) collectBatch(first *PendingRequest) ([]*PendingRequest, *Ef
 	timer := time.NewTimer(p.batchTimeout)
 	defer timer.Stop()
 
-	for len(batch) < p.batchSize {
+	batchSize := 0
+	for batchSize < p.batchSize {
 		select {
 		case req, ok := <-p.requestChan:
 			if !ok {
@@ -291,6 +292,7 @@ func (p *Multipaxos) collectBatch(first *PendingRequest) ([]*PendingRequest, *Ef
 			}
 			batch = append(batch, req)
 			eb.Add(req)
+			batchSize++
 		case <-timer.C:
 			return batch, eb
 		}
