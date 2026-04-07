@@ -81,7 +81,7 @@ func (c *Client) Parse(request string) []*pb.Command {
 
 	commands := make([]*pb.Command, 0, numCommands)
 	for i := 0; i < numCommands; i++ {
-		command.ClientId = c.id
+		command.ClientId = []int64{c.id}
 		commands = append(commands, command)
 	}
 	return commands

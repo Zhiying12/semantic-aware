@@ -251,10 +251,12 @@ func (l *Log) Execute(instance *pb.Instance) []ExecutionResult {
 			continue
 		}
 		res := kvstore.Execute(cmd, l.kvStore)
-		results = append(results, ExecutionResult{
-			ClientId: cmd.ClientId,
-			Result:   res.Value,
-		})
+		for _, clientId := range cmd.ClientId {
+			results = append(results, ExecutionResult{
+				ClientId: clientId,
+				Result:   res.Value,
+			})
+		}
 	}
 	return results
 }

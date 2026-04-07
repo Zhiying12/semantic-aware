@@ -182,17 +182,26 @@ func materializeEffectBatch(eb *EffectBatch) []*pb.Command {
 			commands = append(commands, node.Command)
 
 		case WriteSummaryNode:
+			var clientIDs []int64
+			for _, member := range node.Members {
+				clientIDs = append(clientIDs, member.Req.ClientID)
+			}
+			if len(clientIDs) == 0 {
+				continue
+			}
 			if node.BaseKind == SummaryFromPut {
 				commands = append(commands, &pb.Command{
-					Type:  pb.CommandType_PUT,
-					Key:   node.Key,
-					Value: node.PutValue + node.AppendSuffix,
+					Type:     pb.CommandType_PUT,
+					Key:      node.Key,
+					Value:    node.PutValue + node.AppendSuffix,
+					ClientId: clientIDs,
 				})
 			} else {
 				commands = append(commands, &pb.Command{
-					Type:  pb.CommandType_APPEND,
-					Key:   node.Key,
-					Value: node.AppendSuffix,
+					Type:     pb.CommandType_APPEND,
+					Key:      node.Key,
+					Value:    node.AppendSuffix,
+					ClientId: clientIDs,
 				})
 			}
 		}

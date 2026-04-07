@@ -311,7 +311,7 @@ func (p *Multipaxos) handleReadBatch(batch []*PendingRequest) {
 	barrierIndex := p.log.AdvanceLastIndex()
 	barrierCmd := &pb.Command{
 		Type:     pb.CommandType_NOOP,
-		ClientId: -1,
+		ClientId: []int64{-1},
 	}
 
 	res := p.RunAcceptPhase(ballot, barrierIndex, []*pb.Command{barrierCmd}, -1)
@@ -348,7 +348,7 @@ func (p *Multipaxos) handleWriteBatch(batch []*PendingRequest) {
 	commands := materializeEffectBatch(eb)
 
 	clientID := int64(-1)
-	if len(batch) == 1 {
+	if len(batch) > 0 {
 		clientID = batch[0].ClientID
 	}
 
@@ -724,7 +724,7 @@ func (p *Multipaxos) Replay(ballot int64, lastIndex int64) {
 		} else {
 			cmds = []*pb.Command{{
 				Type:     pb.CommandType_NOOP,
-				ClientId: -1,
+				ClientId: []int64{-1},
 			}}
 			clientId = -1
 		}
