@@ -10,5 +10,6 @@
   "batch_size": 64,
   "batch_timeout": 500,
   "num_logs": 4,
+  "num_virtual_shards": 256,
   "threshold": 3
 }

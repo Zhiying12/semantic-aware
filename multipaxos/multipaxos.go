@@ -53,6 +53,7 @@ type Multipaxos struct {
 	requestChan    chan *PendingRequest
 	batcherRunning int32
 	batcherDone    chan struct{}
+	shardManager   *ShardManager
 
 	pb.UnimplementedMultiPaxosRPCServer
 }
@@ -62,7 +63,8 @@ type PendingRequest struct {
 	Callback chan Result
 }
 
-func NewMultipaxos(logs []*Log.Log, config config.Config, join bool) *Multipaxos {
+func NewMultipaxos(logs []*Log.Log, config config.Config, join bool,
+	shardManager *ShardManager) *Multipaxos {
 	batchSize := config.BatchSize
 	if batchSize <= 0 {
 		batchSize = 1
@@ -93,6 +95,7 @@ func NewMultipaxos(logs []*Log.Log, config config.Config, join bool) *Multipaxos
 		batchTimeout:         time.Duration(config.BatchTimeout) * time.Millisecond,
 		requestChan:          make(chan *PendingRequest, 10000),
 		batcherDone:          make(chan struct{}),
+		shardManager:         shardManager,
 	}
 	multipaxos.rpcServerRunningCv = sync.NewCond(&multipaxos.mu)
 	multipaxos.cvFollower = sync.NewCond(&multipaxos.mu)
@@ -313,10 +316,7 @@ func (p *Multipaxos) Batcher() {
 
 		logCommands := make(map[int32][]*pb.Command)
 		for _, cmd := range combinedCommands {
-			var logId int32 = 0
-			if len(cmd.Key) > 0 {
-				logId = int32(cmd.Key[0]) % int32(p.numLogs)
-			}
+			logId := p.shardManager.GetLogID(cmd.Key)
 			logCommands[logId] = append(logCommands[logId], cmd)
 		}
 
@@ -355,10 +355,7 @@ func (p *Multipaxos) Replicate(commands []*pb.Command, clientId int64) chan Resu
 		if p.batchSize == 1 {
 			logCommands := make(map[int32][]*pb.Command)
 			for _, cmd := range commands {
-				var logId int32 = 0
-				if len(cmd.Key) > 0 {
-					logId = int32(cmd.Key[0]) % int32(p.numLogs)
-				}
+				logId := p.shardManager.GetLogID(cmd.Key)
 				logCommands[logId] = append(logCommands[logId], cmd)
 			}
 			instances := make([]*pb.Instance, 0, len(logCommands))

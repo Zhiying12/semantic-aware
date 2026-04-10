@@ -17,6 +17,7 @@ type Replicant struct {
 	id            int64
 	logs          []*consensusLog.Log
 	multipaxos    *multipaxos.Multipaxos
+	shardManager  *multipaxos.ShardManager
 	ipPort        string
 	acceptor      net.Listener
 	clientManager *ClientManager
@@ -30,14 +31,21 @@ func NewReplicant(config config.Config, join bool) *Replicant {
 	if config.NumLogs == 0 {
 		config.NumLogs = 1
 	}
+	if config.NumVirtualShards == 0 {
+		config.NumVirtualShards = 256
+	}
 	r.logs = make([]*consensusLog.Log, config.NumLogs)
 	for i := 0; i < config.NumLogs; i++ {
 		cfg := config
 		cfg.DbPath = config.DbPath + "_" + strconv.Itoa(i)
 		r.logs[i] = consensusLog.NewLog(kvstore.CreateStore(cfg))
 	}
-	r.multipaxos = multipaxos.NewMultipaxos(r.logs, config, join)
-	r.clientManager = NewClientManager(r.id, int64(len(config.Peers)), r.multipaxos)
+	r.shardManager = multipaxos.NewShardManager(config.NumVirtualShards,
+		config.NumLogs)
+	r.multipaxos = multipaxos.NewMultipaxos(r.logs, config, join,
+		r.shardManager)
+	r.clientManager = NewClientManager(r.id, int64(len(config.Peers)),
+		r.multipaxos)
 	return r
 }
 

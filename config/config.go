@@ -7,16 +7,17 @@ import (
 )
 
 type Config struct {
-	Id             int64
-	Peers          []string `json:"peers"`
-	CommitInterval int64    `json:"commit_interval"`
-	Store          string   `json:"store"`
-	DbPath         string   `json:"db_path"`
-	ElectionLimit  int64    `json:"election_limit"`
-	Threshold      int64    `json:"threshold"`
-	BatchSize      int      `json:"batch_size"`
-	BatchTimeout   int64    `json:"batch_timeout"`
-	NumLogs        int      `json:"num_logs"`
+	Id               int64
+	Peers            []string `json:"peers"`
+	CommitInterval   int64    `json:"commit_interval"`
+	Store            string   `json:"store"`
+	DbPath           string   `json:"db_path"`
+	ElectionLimit    int64    `json:"election_limit"`
+	Threshold        int64    `json:"threshold"`
+	BatchSize        int      `json:"batch_size"`
+	BatchTimeout     int64    `json:"batch_timeout"`
+	NumLogs          int      `json:"num_logs"`
+	NumVirtualShards int      `json:"num_virtual_shards"`
 }
 
 func DefaultConfig(id int64, n int) Config {
@@ -26,11 +27,12 @@ func DefaultConfig(id int64, n int) Config {
 	}
 
 	config := Config{
-		Id:             id,
-		CommitInterval: 3000,
-		Peers:          peers,
-		Store:          "memory",
-		NumLogs:        4,
+		Id:               id,
+		CommitInterval:   3000,
+		Peers:            peers,
+		Store:            "memory",
+		NumLogs:          4,
+		NumVirtualShards: 256,
 	}
 	return config
 }
