@@ -1,8 +1,9 @@
 package multipaxos
 
 import (
-	pb "github.com/psu-csl/replicated-store/go/multipaxos/comm"
 	"sync"
+
+	pb "github.com/psu-csl/replicated-store/go/multipaxos/comm"
 )
 
 const (
@@ -41,6 +42,7 @@ const (
 type Result struct {
 	Type   ResultType
 	Leader int64
+	Value  string
 }
 
 func ExtractLeaderId(ballot int64) int64 {
@@ -58,7 +60,7 @@ func IsSomeoneElseLeader(ballot int64, id int64) bool {
 type PrepareState struct {
 	NumRpcs      int
 	NumOks       int
-	MaxLastIndex int64
+	MaxLastIndex map[int32]int64
 	Mu           sync.Mutex
 	Cv           *sync.Cond
 }
@@ -67,7 +69,7 @@ func NewPrepareState() *PrepareState {
 	prepareState := &PrepareState{
 		NumRpcs:      0,
 		NumOks:       0,
-		MaxLastIndex: 0,
+		MaxLastIndex: make(map[int32]int64),
 	}
 	prepareState.Cv = sync.NewCond(&prepareState.Mu)
 	return prepareState
@@ -92,12 +94,12 @@ func NewAcceptState() *AcceptState {
 type CommitState struct {
 	NumRpcs         int
 	NumOks          int
-	MinLastExecuted int64
+	MinLastExecuted map[int32]int64
 	Mu              sync.Mutex
 	Cv              *sync.Cond
 }
 
-func NewCommitState(minLastExecuted int64) *CommitState {
+func NewCommitState(minLastExecuted map[int32]int64) *CommitState {
 	commitState := &CommitState{
 		NumRpcs:         0,
 		NumOks:          0,
@@ -108,18 +110,18 @@ func NewCommitState(minLastExecuted int64) *CommitState {
 }
 
 type ReplayState struct {
-	NumRpcs int
-	NumOks  int
-	Log     map[int64]*pb.Instance
-	Mu      sync.Mutex
-	Cv      *sync.Cond
+	NumRpcs       int
+	NumOks        int
+	RecoveredLogs map[int32]map[int64]*pb.Instance
+	Mu            sync.Mutex
+	Cv            *sync.Cond
 }
 
 func NewReplayState() *ReplayState {
 	replayState := &ReplayState{
-		NumRpcs: 1,
-		NumOks:  1,
-		Log:     make(map[int64]*pb.Instance),
+		NumRpcs:       1,
+		NumOks:        1,
+		RecoveredLogs: make(map[int32]map[int64]*pb.Instance),
 	}
 	replayState.Cv = sync.NewCond(&replayState.Mu)
 	return replayState

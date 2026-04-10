@@ -22,7 +22,8 @@ import (
 
 type Multipaxos struct {
 	ballot         int64
-	log            *Log.Log
+	logs           []*Log.Log
+	numLogs        int
 	id             int64
 	commitReceived int32
 	commitInterval int64
@@ -61,7 +62,7 @@ type PendingRequest struct {
 	Callback chan Result
 }
 
-func NewMultipaxos(log *Log.Log, config config.Config, join bool) *Multipaxos {
+func NewMultipaxos(logs []*Log.Log, config config.Config, join bool) *Multipaxos {
 	batchSize := config.BatchSize
 	if batchSize <= 0 {
 		batchSize = 1
@@ -69,7 +70,8 @@ func NewMultipaxos(log *Log.Log, config config.Config, join bool) *Multipaxos {
 
 	multipaxos := Multipaxos{
 		ballot:         MaxNumPeers,
-		log:            log,
+		logs:           logs,
+		numLogs:        config.NumLogs,
 		id:             config.Id,
 		commitReceived: 0,
 		commitInterval: config.CommitInterval,
@@ -126,7 +128,7 @@ func (p *Multipaxos) NextBallot() int64 {
 	return nextBallot
 }
 
-func (p *Multipaxos) BecomeLeader(newBallot int64, newLastIndex int64) {
+func (p *Multipaxos) BecomeLeader(newBallot int64, newLastIndices map[int32]int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -134,7 +136,9 @@ func (p *Multipaxos) BecomeLeader(newBallot int64, newLastIndex int64) {
 	logger.Errorf("time: %v, %v became a leader: ballot: %v -> %v, "+
 		"initialized number of elections: %v\n", tp, p.id, p.Ballot(),
 		newBallot, p.numElections)
-	p.log.SetLastIndex(newLastIndex)
+	for logId, idx := range newLastIndices {
+		p.logs[logId].SetLastIndex(idx)
+	}
 	atomic.StoreInt64(&p.ballot, newBallot)
 	p.cvLeader.Signal()
 }
@@ -307,12 +311,33 @@ func (p *Multipaxos) Batcher() {
 			combinedCommands = append(combinedCommands, r.Commands...)
 		}
 
+		logCommands := make(map[int32][]*pb.Command)
+		for _, cmd := range combinedCommands {
+			var logId int32 = 0
+			if len(cmd.Key) > 0 {
+				logId = int32(cmd.Key[0]) % int32(p.numLogs)
+			}
+			logCommands[logId] = append(logCommands[logId], cmd)
+		}
+
 		var result Result
 		ballot := p.Ballot()
 		if !IsLeader(ballot, p.id) {
 			result = Result{Type: SomeElseLeader, Leader: ExtractLeaderId(ballot)}
 		} else {
-			result = p.RunAcceptPhase(ballot, p.log.AdvanceLastIndex(), combinedCommands, -1)
+			instances := make([]*pb.Instance, 0, len(logCommands))
+			for logId, cmds := range logCommands {
+				index := p.logs[logId].AdvanceLastIndex()
+				instances = append(instances, &pb.Instance{
+					Ballot:   ballot,
+					Index:    index,
+					ClientId: -1,
+					State:    pb.InstanceState_INPROGRESS,
+					Commands: cmds,
+					LogId:    logId,
+				})
+			}
+			result = p.RunAcceptPhase(ballot, instances)
 		}
 
 		for _, r := range batch {
@@ -328,7 +353,27 @@ func (p *Multipaxos) Replicate(commands []*pb.Command, clientId int64) chan Resu
 	ballot := p.Ballot()
 	if IsLeader(ballot, p.id) {
 		if p.batchSize == 1 {
-			result := p.RunAcceptPhase(ballot, p.log.AdvanceLastIndex(), commands, clientId)
+			logCommands := make(map[int32][]*pb.Command)
+			for _, cmd := range commands {
+				var logId int32 = 0
+				if len(cmd.Key) > 0 {
+					logId = int32(cmd.Key[0]) % int32(p.numLogs)
+				}
+				logCommands[logId] = append(logCommands[logId], cmd)
+			}
+			instances := make([]*pb.Instance, 0, len(logCommands))
+			for logId, cmds := range logCommands {
+				index := p.logs[logId].AdvanceLastIndex()
+				instances = append(instances, &pb.Instance{
+					Ballot:   ballot,
+					Index:    index,
+					ClientId: clientId,
+					State:    pb.InstanceState_INPROGRESS,
+					Commands: cmds,
+					LogId:    logId,
+				})
+			}
+			result := p.RunAcceptPhase(ballot, instances)
 			resultChan <- result
 			return resultChan
 		}
@@ -362,11 +407,11 @@ func (p *Multipaxos) PrepareThread() {
 				continue
 			}
 			nextBallot := p.NextBallot()
-			maxLastIndex, _ := p.RunPreparePhase(nextBallot)
+			maxLastIndices, _ := p.RunPreparePhase(nextBallot)
 			p.countElection()
-			if maxLastIndex != -1 {
-				p.BecomeLeader(nextBallot, maxLastIndex)
-				p.Replay(nextBallot, maxLastIndex)
+			if maxLastIndices != nil {
+				p.BecomeLeader(nextBallot, maxLastIndices)
+				p.Replay(nextBallot, maxLastIndices)
 				break
 			}
 		}
@@ -381,7 +426,10 @@ func (p *Multipaxos) CommitThread() {
 		}
 		p.mu.Unlock()
 
-		gle := p.log.GlobalLastExecuted()
+		gle := make(map[int32]int64)
+		for i := int32(0); i < int32(p.numLogs); i++ {
+			gle[i] = p.logs[i].GlobalLastExecuted()
+		}
 		for atomic.LoadInt32(&p.commitThreadRunning) == 1 {
 			ballot := p.Ballot()
 			if !IsLeader(ballot, p.id) {
@@ -393,7 +441,7 @@ func (p *Multipaxos) CommitThread() {
 	}
 }
 
-func (p *Multipaxos) RunPreparePhase(ballot int64) (int64,
+func (p *Multipaxos) RunPreparePhase(ballot int64) (map[int32]int64,
 	map[int64]*pb.Instance) {
 	state := NewPrepareState()
 
@@ -405,9 +453,11 @@ func (p *Multipaxos) RunPreparePhase(ballot int64) (int64,
 	if ballot > p.Ballot() {
 		state.NumRpcs++
 		state.NumOks++
-		state.MaxLastIndex = p.log.LastIndex()
+		for i := int32(0); i < int32(p.numLogs); i++ {
+			state.MaxLastIndex[i] = p.logs[i].LastIndex()
+		}
 	} else {
-		return -1, nil
+		return nil, nil
 	}
 
 	p.rpcPeers.RLock()
@@ -429,8 +479,10 @@ func (p *Multipaxos) RunPreparePhase(ballot int64) (int64,
 			if err == nil {
 				if response.GetType() == pb.ResponseType_OK {
 					state.NumOks += 1
-					if response.GetLastIndex() > state.MaxLastIndex {
-						state.MaxLastIndex = response.GetLastIndex()
+					for k, v := range response.GetLastIndex() {
+						if v > state.MaxLastIndex[k] {
+							state.MaxLastIndex[k] = v
+						}
 					}
 				} else {
 					p.BecomeFollower(response.GetBallot())
@@ -451,39 +503,26 @@ func (p *Multipaxos) RunPreparePhase(ballot int64) (int64,
 	if state.NumOks > numPeers/2 {
 		return state.MaxLastIndex, nil
 	}
-	return -1, nil
+	return nil, nil
 }
 
-func (p *Multipaxos) RunAcceptPhase(ballot int64, index int64,
-	commands []*pb.Command, clientId int64) Result {
+func (p *Multipaxos) RunAcceptPhase(ballot int64, instances []*pb.Instance) Result {
 	state := NewAcceptState()
 
-	instance := pb.Instance{
-		Ballot:   ballot,
-		Index:    index,
-		ClientId: clientId,
-		State:    pb.InstanceState_INPROGRESS,
-		Commands: commands,
-	}
-
 	if ballot == p.Ballot() {
-		instance := pb.Instance{
-			Ballot:   ballot,
-			Index:    index,
-			ClientId: clientId,
-			State:    pb.InstanceState_INPROGRESS,
-			Commands: commands,
-		}
 		state.NumRpcs++
 		state.NumOks++
-		p.log.Append(&instance)
+		for _, instance := range instances {
+			p.logs[instance.LogId].Append(instance)
+		}
 	} else {
-		return Result{SomeElseLeader, ExtractLeaderId(p.Ballot())}
+		return Result{Type: SomeElseLeader, Leader: ExtractLeaderId(p.Ballot())}
 	}
 
 	request := pb.AcceptRequest{
-		Sender:   p.id,
-		Instance: &instance,
+		Sender:    p.id,
+		Instances: instances,
+		Ballot:    ballot,
 	}
 
 	p.rpcPeers.RLock()
@@ -521,7 +560,9 @@ func (p *Multipaxos) RunAcceptPhase(ballot int64, index int64,
 	}
 
 	if state.NumOks > numPeers/2 {
-		p.log.Commit(index)
+		for _, instance := range instances {
+			p.logs[instance.LogId].Commit(instance.Index)
+		}
 		return Result{Type: Ok, Leader: -1}
 	}
 	if !IsLeader(p.Ballot(), p.id) {
@@ -530,8 +571,13 @@ func (p *Multipaxos) RunAcceptPhase(ballot int64, index int64,
 	return Result{Type: Retry, Leader: -1}
 }
 
-func (p *Multipaxos) RunCommitPhase(ballot int64, globalLastExecuted int64) int64 {
-	state := NewCommitState(p.log.LastExecuted())
+func (p *Multipaxos) RunCommitPhase(ballot int64, globalLastExecuted map[int32]int64) map[int32]int64 {
+	minLastExecuted := make(map[int32]int64)
+	for i := int32(0); i < int32(p.numLogs); i++ {
+		minLastExecuted[i] = p.logs[i].LastExecuted()
+		p.logs[i].TrimUntil(globalLastExecuted[i])
+	}
+	state := NewCommitState(minLastExecuted)
 
 	request := pb.CommitRequest{
 		Ballot:             ballot,
@@ -542,8 +588,6 @@ func (p *Multipaxos) RunCommitPhase(ballot int64, globalLastExecuted int64) int6
 
 	state.NumRpcs++
 	state.NumOks++
-	state.MinLastExecuted = p.log.LastExecuted()
-	p.log.TrimUntil(globalLastExecuted)
 
 	p.rpcPeers.RLock()
 	numPeers := len(p.rpcPeers.List)
@@ -565,8 +609,10 @@ func (p *Multipaxos) RunCommitPhase(ballot int64, globalLastExecuted int64) int6
 			if err == nil {
 				if response.GetType() == pb.ResponseType_OK {
 					state.NumOks += 1
-					if response.GetLastExecuted() < state.MinLastExecuted {
-						state.MinLastExecuted = response.GetLastExecuted()
+					for k, v := range response.GetLastExecuted() {
+						if v < state.MinLastExecuted[k] {
+							state.MinLastExecuted[k] = v
+						}
 					}
 				} else {
 					p.BecomeFollower(response.GetBallot())
@@ -589,14 +635,20 @@ func (p *Multipaxos) RunCommitPhase(ballot int64, globalLastExecuted int64) int6
 	return globalLastExecuted
 }
 
-func (p *Multipaxos) Replay(ballot int64, lastIndex int64) {
+func (p *Multipaxos) Replay(ballot int64, lastIndices map[int32]int64) {
 	state := NewReplayState()
-	state.Log = p.log.GetLog()
+
+	for i := int32(0); i < int32(p.numLogs); i++ {
+		state.RecoveredLogs[i] = p.logs[i].GetLog()
+	}
 
 	request := pb.InstanceRequest{
-		LastIndex:    lastIndex,
-		LastExecuted: p.log.GlobalLastExecuted(),
+		LastIndex:    lastIndices,
+		LastExecuted: make(map[int32]int64),
 		Sender:       p.id,
+	}
+	for i := int32(0); i < int32(p.numLogs); i++ {
+		request.LastExecuted[i] = p.logs[i].GlobalLastExecuted()
 	}
 
 	p.rpcPeers.RLock()
@@ -623,7 +675,7 @@ func (p *Multipaxos) Replay(ballot int64, lastIndex int64) {
 					break
 				}
 				state.Mu.Lock()
-				Log.Insert(state.Log, instance)
+				Log.Insert(state.RecoveredLogs[instance.LogId], instance)
 				state.Mu.Unlock()
 			}
 			state.Cv.Signal()
@@ -637,42 +689,59 @@ func (p *Multipaxos) Replay(ballot int64, lastIndex int64) {
 		state.Cv.Wait()
 	}
 
-	for index := request.LastExecuted + 1; index <= request.LastIndex; index++ {
-		instance, ok := state.Log[index]
-		var cmds []*pb.Command
-		var clientId int64
-		if ok {
-			cmds = instance.GetCommands()
-			clientId = instance.GetClientId()
-		} else {
-			cmds = []*pb.Command{{
-				Type: pb.CommandType_GET,
-				Key:  "1",
-			}}
-			clientId = -1
-		}
-		go func(index int64, cmds []*pb.Command, clientId int64) {
-			r := p.RunAcceptPhase(ballot, index, cmds, clientId)
+	for logId, lastIndex := range lastIndices {
+		for index := request.LastExecuted[logId] + 1; index <= lastIndex; index++ {
+			instance, ok := state.RecoveredLogs[logId][index]
+			var cmds []*pb.Command
+			var clientId int64
+			if ok {
+				cmds = instance.GetCommands()
+				clientId = instance.GetClientId()
+			} else {
+				cmds = []*pb.Command{{
+					Type: pb.CommandType_GET,
+					Key:  "1",
+				}}
+				clientId = -1
+			}
+			go func(index int64, cmds []*pb.Command, clientId int64, logId int32) {
+				inst := &pb.Instance{
+					Ballot:   ballot,
+					Index:    index,
+					ClientId: clientId,
+					State:    pb.InstanceState_INPROGRESS,
+					Commands: cmds,
+					LogId:    logId,
+				}
+				r := p.RunAcceptPhase(ballot, []*pb.Instance{inst})
 
-			for r.Type == Retry {
-				r = p.RunAcceptPhase(ballot, index, cmds, clientId)
-			}
-			if r.Type == SomeElseLeader {
-				return
-			}
-		}(index, cmds, clientId)
+				for r.Type == Retry {
+					r = p.RunAcceptPhase(ballot, []*pb.Instance{inst})
+				}
+				if r.Type == SomeElseLeader {
+					return
+				}
+			}(index, cmds, clientId, logId)
+		}
 	}
 }
 
 func (p *Multipaxos) RequestInstanceGap() {
-	leaderId := ExtractLeaderId(p.ballot)
+	leaderId := ExtractLeaderId(p.Ballot())
 	request := pb.InstanceRequest{
-		LastIndex:    p.log.LastIndex(),
-		LastExecuted: p.log.LastExecuted(),
+		LastIndex:    make(map[int32]int64),
+		LastExecuted: make(map[int32]int64),
 		Sender:       p.id,
 	}
-	if request.LastIndex == request.LastExecuted {
-		request.LastIndex = -1
+	for i := int32(0); i < int32(p.numLogs); i++ {
+		lastIdx := p.logs[i].LastIndex()
+		lastExec := p.logs[i].LastExecuted()
+		if lastIdx == lastExec {
+			request.LastIndex[i] = -1
+		} else {
+			request.LastIndex[i] = lastIdx
+		}
+		request.LastExecuted[i] = lastExec
 	}
 	stream, err := p.rpcPeers.List[leaderId].Stub.InstancesGap(context.
 		Background(), &request)
@@ -691,7 +760,7 @@ func (p *Multipaxos) RequestInstanceGap() {
 			logger.Error(err)
 			break
 		}
-		p.log.Append(instance)
+		p.logs[instance.LogId].Append(instance)
 	}
 	//logger.Infof("Recovered missing instances, recv: %v\n", count)
 }
@@ -721,21 +790,23 @@ func (p *Multipaxos) Reconfigure(cmd *pb.Command) {
 			if err != nil {
 				return
 			}
-			buffer, err := p.log.MakeSnapshot(p.ballot)
-			if err != nil {
-				return
-			}
-			for offset := 0; offset < buffer.Len(); offset += ChunkSize {
-				var chunk []byte
-				if offset+ChunkSize > buffer.Len() {
-					chunk = buffer.Bytes()[offset:]
-				} else {
-					chunk = buffer.Bytes()[offset : offset+ChunkSize]
-				}
-				err = stream.Send(&pb.SnapshotRequest{Chunk: chunk})
+			for i := int32(0); i < int32(p.numLogs); i++ {
+				buffer, err := p.logs[i].MakeSnapshot(p.Ballot())
 				if err != nil {
-					logger.Error(err)
 					return
+				}
+				for offset := 0; offset < buffer.Len(); offset += ChunkSize {
+					var chunk []byte
+					if offset+ChunkSize > buffer.Len() {
+						chunk = buffer.Bytes()[offset:]
+					} else {
+						chunk = buffer.Bytes()[offset : offset+ChunkSize]
+					}
+					err = stream.Send(&pb.SnapshotRequest{Chunk: chunk, LogId: i})
+					if err != nil {
+						logger.Error(err)
+						return
+					}
 				}
 			}
 			_, err = stream.CloseAndRecv()
@@ -771,10 +842,14 @@ func (p *Multipaxos) countElection() {
 func (p *Multipaxos) Prepare(ctx context.Context,
 	request *pb.PrepareRequest) (*pb.PrepareResponse, error) {
 	logger.Infof("%v <--prepare-- %v", p.id, request.GetSender())
-	response := &pb.PrepareResponse{}
+	response := &pb.PrepareResponse{
+		LastIndex: make(map[int32]int64),
+	}
 	if request.GetBallot() > p.Ballot() {
 		p.BecomeFollower(request.GetBallot())
-		response.LastIndex = p.log.LastIndex()
+		for i := int32(0); i < int32(p.numLogs); i++ {
+			response.LastIndex[i] = p.logs[i].LastIndex()
+		}
 		response.Type = pb.ResponseType_OK
 	} else {
 		response.Ballot = p.Ballot()
@@ -787,14 +862,19 @@ func (p *Multipaxos) Accept(ctx context.Context,
 	request *pb.AcceptRequest) (*pb.AcceptResponse, error) {
 	logger.Infof("%v <--accept-- %v", p.id, request.GetSender())
 	response := &pb.AcceptResponse{}
-	if request.GetInstance().GetBallot() >= p.Ballot() {
-		p.log.Append(request.GetInstance())
-		response.Type = pb.ResponseType_OK
-		if request.GetInstance().GetBallot() > p.Ballot() {
-			p.BecomeFollower(request.GetInstance().GetBallot())
+
+	maxBallot := request.GetBallot()
+	if maxBallot >= p.Ballot() {
+		for _, instance := range request.GetInstances() {
+			if instance.GetBallot() >= p.Ballot() {
+				p.logs[instance.LogId].Append(instance)
+			}
 		}
-	}
-	if request.GetInstance().GetBallot() < p.Ballot() {
+		response.Type = pb.ResponseType_OK
+		if maxBallot > p.Ballot() {
+			p.BecomeFollower(maxBallot)
+		}
+	} else {
 		response.Ballot = p.Ballot()
 		response.Type = pb.ResponseType_REJECT
 	}
@@ -804,12 +884,20 @@ func (p *Multipaxos) Accept(ctx context.Context,
 func (p *Multipaxos) Commit(ctx context.Context,
 	request *pb.CommitRequest) (*pb.CommitResponse, error) {
 	logger.Infof("%v <--commit-- %v", p.id, request.GetSender())
-	response := &pb.CommitResponse{}
+	response := &pb.CommitResponse{
+		LastExecuted: make(map[int32]int64),
+	}
 	if request.GetBallot() >= p.Ballot() {
 		atomic.StoreInt32(&p.commitReceived, 1)
-		p.log.CommitUntil(request.GetLastExecuted(), request.GetBallot())
-		p.log.TrimUntil(request.GetGlobalLastExecuted())
-		response.LastExecuted = p.log.LastExecuted()
+		for logId, lastExec := range request.GetLastExecuted() {
+			p.logs[logId].CommitUntil(lastExec, request.GetBallot())
+		}
+		for logId, globalLastExec := range request.GetGlobalLastExecuted() {
+			p.logs[logId].TrimUntil(globalLastExec)
+		}
+		for i := int32(0); i < int32(p.numLogs); i++ {
+			response.LastExecuted[i] = p.logs[i].LastExecuted()
+		}
 		response.Type = pb.ResponseType_OK
 		if request.GetBallot() > p.Ballot() {
 			p.BecomeFollower(request.GetBallot())
@@ -823,18 +911,29 @@ func (p *Multipaxos) Commit(ctx context.Context,
 
 func (p *Multipaxos) ResumeSnapshot(stream pb.MultiPaxosRPC_ResumeSnapshotServer) error {
 	logger.Infof("%v <--snapshot--\n", p.id)
-	buffer := &bytes.Buffer{}
+	buffers := make(map[int32]*bytes.Buffer)
+	for i := int32(0); i < int32(p.numLogs); i++ {
+		buffers[i] = &bytes.Buffer{}
+	}
 	for {
 		snapshotChunk, err := stream.Recv()
 		if err == io.EOF {
-			snapshot := &Log.Snapshot{}
-			err = gob.NewDecoder(buffer).Decode(snapshot)
-			if err != nil {
-				logger.Error(err)
-				return err
+			var lastBallot int64
+			for logId, buffer := range buffers {
+				if buffer.Len() > 0 {
+					snapshot := &Log.Snapshot{}
+					err = gob.NewDecoder(buffer).Decode(snapshot)
+					if err != nil {
+						logger.Error(err)
+						return err
+					}
+					lastBallot = snapshot.Ballot
+					p.logs[logId].ResumeSnapshot(snapshot)
+				}
 			}
-			p.BecomeFollower(snapshot.Ballot)
-			p.log.ResumeSnapshot(snapshot)
+			if lastBallot > 0 {
+				p.BecomeFollower(lastBallot)
+			}
 			p.mu.Lock()
 			p.joinReady = true
 			p.cvLeader.Signal()
@@ -846,33 +945,37 @@ func (p *Multipaxos) ResumeSnapshot(stream pb.MultiPaxosRPC_ResumeSnapshotServer
 			logger.Error(err)
 			return err
 		}
-		buffer.Write(snapshotChunk.GetChunk())
+		buffers[snapshotChunk.GetLogId()].Write(snapshotChunk.GetChunk())
 	}
 }
 
 func (p *Multipaxos) InstancesGap(request *pb.InstanceRequest,
 	stream pb.MultiPaxosRPC_InstancesGapServer) error {
 	logger.Infof("%v <--instances request-- %v\n", p.id, request.GetSender())
-	instances := p.log.InstancesRange(request.GetLastExecuted(),
-		request.GetLastIndex())
-	ballot := request.GetBallot()
-	for _, instance := range instances {
-		err := stream.Send(instance)
-		if err != nil {
-			logger.Error(err)
-			return err
-		} else if p.Ballot() > ballot {
-			return nil
+	for logId, lastIndex := range request.GetLastIndex() {
+		lastExecuted := request.GetLastExecuted()[logId]
+		instances := p.logs[logId].InstancesRange(lastExecuted, lastIndex)
+		ballot := request.GetBallot()
+		for _, instance := range instances {
+			err := stream.Send(instance)
+			if err != nil {
+				logger.Error(err)
+				return err
+			} else if p.Ballot() > ballot {
+				return nil
+			}
 		}
 	}
 	return nil
 }
 
 func (p *Multipaxos) Monitor() {
-	length, lastIndex, lastExecuted, gle, indice := p.log.GetLogStatus()
-	logger.Errorf("ballot: %v, log len: %v, last_index: %v, "+
-		"last_executed: %v, gle: %v, indice: %v, node_list: %v", p.Ballot(),
-		length, lastIndex, lastExecuted, gle, indice, p.rpcPeers.List)
+	for i := 0; i < p.numLogs; i++ {
+		length, lastIndex, lastExecuted, gle, indice := p.logs[i].GetLogStatus()
+		logger.Errorf("log %v ballot: %v, log len: %v, last_index: %v, "+
+			"last_executed: %v, gle: %v, indice: %v, node_list: %v", i, p.Ballot(),
+			length, lastIndex, lastExecuted, gle, indice, p.rpcPeers.List)
+	}
 }
 
 func (p *Multipaxos) TriggerElection() {

@@ -16,6 +16,7 @@ type Config struct {
 	Threshold      int64    `json:"threshold"`
 	BatchSize      int      `json:"batch_size"`
 	BatchTimeout   int64    `json:"batch_timeout"`
+	NumLogs        int      `json:"num_logs"`
 }
 
 func DefaultConfig(id int64, n int) Config {
@@ -29,6 +30,7 @@ func DefaultConfig(id int64, n int) Config {
 		CommitInterval: 3000,
 		Peers:          peers,
 		Store:          "memory",
+		NumLogs:        4,
 	}
 	return config
 }

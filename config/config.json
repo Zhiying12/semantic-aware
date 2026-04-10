@@ -9,5 +9,6 @@
   "election_limit": 3000,
   "batch_size": 64,
   "batch_timeout": 500,
+  "num_logs": 4,
   "threshold": 3
 }

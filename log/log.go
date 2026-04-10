@@ -41,7 +41,8 @@ func IsEqualCommand(cmd1, cmd2 *pb.Command) bool {
 
 func IsEqualInstance(a, b *pb.Instance) bool {
 	if a.GetBallot() != b.GetBallot() || a.GetIndex() != b.GetIndex() ||
-		a.GetClientId() != b.GetClientId() || a.GetState() != b.GetState() {
+		a.GetClientId() != b.GetClientId() || a.GetState() != b.GetState() ||
+		a.GetLogId() != b.GetLogId() {
 		return false
 	}
 	if len(a.GetCommands()) != len(b.GetCommands()) {

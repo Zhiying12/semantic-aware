@@ -15,7 +15,7 @@ import (
 
 type Replicant struct {
 	id            int64
-	log           *consensusLog.Log
+	logs          []*consensusLog.Log
 	multipaxos    *multipaxos.Multipaxos
 	ipPort        string
 	acceptor      net.Listener
@@ -27,8 +27,16 @@ func NewReplicant(config config.Config, join bool) *Replicant {
 		id:     config.Id,
 		ipPort: config.Peers[config.Id],
 	}
-	r.log = consensusLog.NewLog(kvstore.CreateStore(config))
-	r.multipaxos = multipaxos.NewMultipaxos(r.log, config, join)
+	if config.NumLogs == 0 {
+		config.NumLogs = 1
+	}
+	r.logs = make([]*consensusLog.Log, config.NumLogs)
+	for i := 0; i < config.NumLogs; i++ {
+		cfg := config
+		cfg.DbPath = config.DbPath + "_" + strconv.Itoa(i)
+		r.logs[i] = consensusLog.NewLog(kvstore.CreateStore(cfg))
+	}
+	r.multipaxos = multipaxos.NewMultipaxos(r.logs, config, join)
 	r.clientManager = NewClientManager(r.id, int64(len(config.Peers)), r.multipaxos)
 	return r
 }
@@ -73,21 +81,25 @@ func (r *Replicant) StopServer() {
 
 func (r *Replicant) StartExecutorThread() {
 	logger.Infof("%v starting executor thread\n", r.id)
-	go r.executorThread()
+	for i := 0; i < len(r.logs); i++ {
+		go r.executorThread(i)
+	}
 }
 
 func (r *Replicant) StopExecutorThread() {
 	logger.Infof("%v stopping executor thread\n", r.id)
-	r.log.Stop()
+	for i := 0; i < len(r.logs); i++ {
+		r.logs[i].Stop()
+	}
 }
 
 func (r *Replicant) StartRpcServer() {
 	r.multipaxos.StartRPCServer()
 }
 
-func (r *Replicant) executorThread() {
+func (r *Replicant) executorThread(logId int) {
 	for {
-		instance := r.log.ReadInstance()
+		instance := r.logs[logId].ReadInstance()
 		if instance == nil {
 			break
 		}
@@ -95,15 +107,15 @@ func (r *Replicant) executorThread() {
 			continue
 		}
 
-		if instance.Commands[0].Type == pb.CommandType_ADDNODE || instance.
-			Commands[0].Type == pb.CommandType_DELNODE {
+		if instance.Commands[0].Type == pb.CommandType_ADDNODE ||
+			instance.Commands[0].Type == pb.CommandType_DELNODE {
 			r.multipaxos.Reconfigure(instance.Commands[0])
 			client := r.clientManager.Get(instance.ClientId)
 			if client != nil {
 				client.Write("joined")
 			}
 		} else {
-			results := r.log.Execute(instance)
+			results := r.logs[logId].Execute(instance)
 			if len(results) == 0 {
 				continue
 			}
