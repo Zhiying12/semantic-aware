@@ -28,6 +28,8 @@ type KVStore interface {
 func CreateStore(config config.Config) KVStore {
 	if config.Store == "rocksdb" {
 		return nil
+	} else if config.Store == "pebble" {
+		return NewPebbleKVStore(config.DbPath)
 	} else if config.Store == "mem" {
 		return NewMemKVStore()
 	} else {
